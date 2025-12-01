@@ -141,5 +141,3 @@ class Scheduler {
     return this.jobs;
   }
 }
-
-module.exports = { Competitor, Exporter, Scheduler };
