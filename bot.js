@@ -133,48 +133,57 @@ function applyAdvancedFilters(leads, params) {
 async function scrapeOpenStreetMap(params, countryCoord) {
   const leads = [];
   try {
-    const categoryOSMMap = {
-      'saas': 'office=company OR office=yes',
-      'plumbers': 'shop=plumbing OR craft=plumber',
-      'electricians': 'craft=electrician OR shop=electrical',
-      'restaurants': 'amenity=restaurant OR amenity=cafe OR amenity=fast_food',
-      'salons': 'shop=hairdresser OR amenity=salon',
-      'dentist': 'amenity=clinic OR healthcare=dentist',
-      'doctor': 'amenity=clinic OR amenity=doctors OR healthcare=doctor',
-      'consultants': 'office=yes OR office=company',
-      'accountants': 'office=accountant',
-      'lawyers': 'office=lawyer',
-      'gyms': 'leisure=fitness_centre OR leisure=gym',
-      'hotels': 'tourism=hotel OR amenity=hotel'
+    // Simpler, more reliable queries
+    const categoryQueryMap = {
+      'gym': 'leisure=fitness_centre;leisure=gym',
+      'gyms': 'leisure=fitness_centre;leisure=gym',
+      'restaurant': 'amenity=restaurant;amenity=cafe;amenity=fast_food',
+      'restaurants': 'amenity=restaurant;amenity=cafe;amenity=fast_food',
+      'plumber': 'craft=plumber;shop=plumbing',
+      'plumbers': 'craft=plumber;shop=plumbing',
+      'salon': 'shop=hairdresser;shop=beauty',
+      'salons': 'shop=hairdresser;shop=beauty',
+      'hotel': 'tourism=hotel;amenity=hotel',
+      'hotels': 'tourism=hotel;amenity=hotel',
+      'doctor': 'amenity=doctors;amenity=clinic;healthcare=doctor',
+      'dentist': 'amenity=dentist;healthcare=dentist'
     };
 
-    const osmFilter = categoryOSMMap[params.category] || `name~"${params.category}"`;
-    const radius = Math.min(params.radius / 111, 0.5);
-
-    const bbox = `${countryCoord.lat - radius},${countryCoord.lon - radius},${countryCoord.lat + radius},${countryCoord.lon + radius}`;
-    const overpassUrl = `https://overpass-api.de/api/interpreter?data=[bbox:${bbox}];(${osmFilter});out center;`;
+    const query = categoryQueryMap[params.category.toLowerCase()] || params.category;
     
-    const response = await fetch(overpassUrl, { timeout: 25000 });
+    // Use smaller radius for better results
+    const radius = Math.min(params.radius / 111, 0.3);
+    const bbox = `${countryCoord.lat - radius},${countryCoord.lon - radius},${countryCoord.lat + radius},${countryCoord.lon + radius}`;
+    
+    // Build simpler Overpass query
+    const queryParts = query.split(';').map(q => `(${q})`).join(';');
+    const overpassUrl = `https://overpass-api.de/api/interpreter?data=[bbox:${bbox}];(node[name]${queryParts};);out center;`;
+    
+    console.log('Querying Overpass:', overpassUrl.substring(0, 100));
+    
+    const response = await fetch(overpassUrl, { timeout: 30000 });
     
     if (!response.ok) {
-      console.log('Overpass API rate limited, trying fallback...');
+      console.log('Overpass rate limited, falling back to Nominatim...');
       return [];
     }
 
     const osmResult = await response.text();
     if (!osmResult || osmResult.length < 100) {
+      console.log('Empty Overpass response');
       return [];
     }
 
+    // Parse nodes
     const nodeRegex = /<node[^>]*id="(\d+)"[^>]*lat="([^"]+)"[^"]+lon="([^"]+)"[^>]*>([\s\S]*?)<\/node>/g;
     
     let match;
     let count = 0;
 
-    while ((match = nodeRegex.exec(osmResult)) !== null && count < 150) {
+    while ((match = nodeRegex.exec(osmResult)) !== null && count < 100) {
       const tags = extractOSMTags(match[4]);
       
-      if (tags.name && tags.name.length > 2) {
+      if (tags.name && tags.name.length > 1) {
         const qualityScore = calculateQualityScore({
           hasEmail: !!tags.email,
           hasPhone: !!tags.phone,
@@ -203,6 +212,7 @@ async function scrapeOpenStreetMap(params, countryCoord) {
       }
     }
 
+    console.log(`OSM found ${leads.length} leads`);
     return leads;
   } catch (error) {
     console.log('OpenStreetMap scraping failed:', error.message);
@@ -213,46 +223,83 @@ async function scrapeOpenStreetMap(params, countryCoord) {
 async function scrapeNominatim(params, countryCoord) {
   const leads = [];
   try {
-    const searchUrl = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(params.category)}%20${encodeURIComponent(params.city)}&countrycodes=${params.country}&format=json&limit=80&addressdetails=1`;
-    
-    const response = await fetch(searchUrl, {
-      headers: { 'User-Agent': 'LeadScraperBot/4.0' },
-      timeout: 20000
-    });
+    // Multiple search queries for better coverage
+    const queries = [
+      `${params.category} in ${params.city}`,
+      `${params.category} ${params.city}`,
+      params.city
+    ];
 
-    if (!response.ok) return [];
-
-    const data = await response.json();
-    if (!Array.isArray(data)) return [];
-
-    for (const result of data.slice(0, 60)) {
-      if (result.display_name && result.display_name.length > 2) {
-        const qualityScore = calculateQualityScore({
-          hasEmail: false,
-          hasPhone: false,
-          hasWebsite: false,
-          hasAddress: true,
-          hasHours: false
+    for (const q of queries) {
+      try {
+        const searchUrl = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&countrycodes=${params.country}&format=json&limit=50`;
+        
+        const response = await fetch(searchUrl, {
+          headers: { 'User-Agent': 'Mozilla/5.0' },
+          timeout: 20000
         });
 
-        leads.push({
-          name: result.display_name.split(',')[0].substring(0, 100),
-          address: result.display_name.substring(0, 200),
-          phone: null,
-          website: null,
-          email: null,
-          source: 'nominatim',
-          quality_score: qualityScore,
-          verified: false,
-          rating: null,
-          distance: calculateDistance(parseFloat(result.lat), parseFloat(result.lon), countryCoord.lat, countryCoord.lon),
-          email_valid: false,
-          phone_valid: false
-        });
+        if (!response.ok) continue;
+
+        const data = await response.json();
+        if (!Array.isArray(data)) continue;
+
+        for (const result of data) {
+          if (result.display_name && result.display_name.length > 3) {
+            // Filter by distance
+            const dist = calculateDistance(
+              parseFloat(result.lat), 
+              parseFloat(result.lon), 
+              countryCoord.lat, 
+              countryCoord.lon
+            );
+
+            if (dist <= params.radius) {
+              const qualityScore = calculateQualityScore({
+                hasEmail: false,
+                hasPhone: false,
+                hasWebsite: false,
+                hasAddress: true,
+                hasHours: false
+              });
+
+              const name = result.display_name.split(',')[0].trim();
+              
+              // Avoid duplicates
+              const isDuplicate = leads.some(l => 
+                l.name.toLowerCase() === name.toLowerCase()
+              );
+
+              if (!isDuplicate && name.length > 2) {
+                leads.push({
+                  name: name.substring(0, 100),
+                  address: result.display_name.substring(0, 200),
+                  phone: null,
+                  website: null,
+                  email: null,
+                  source: 'nominatim',
+                  quality_score: qualityScore,
+                  verified: false,
+                  rating: null,
+                  distance: dist,
+                  email_valid: false,
+                  phone_valid: false
+                });
+              }
+            }
+          }
+        }
+
+        if (leads.length > 30) break; // Got enough results
+
+      } catch (e) {
+        console.log('Query failed:', q);
       }
     }
 
+    console.log(`Nominatim found ${leads.length} leads`);
     return leads;
+
   } catch (error) {
     console.log('Nominatim scraping failed:', error.message);
     return [];
@@ -263,15 +310,21 @@ async function executeAdvancedScraping(params, countryCoord) {
   const leads = [];
 
   try {
-    // Try OSM first
+    console.log(`Starting scrape: ${params.category} in ${params.city}`);
+
+    // Try OSM first (faster if works)
+    console.log('Trying Overpass API...');
     const osmLeads = await scrapeOpenStreetMap(params, countryCoord);
     leads.push(...osmLeads);
+    console.log(`OSM results: ${osmLeads.length}`);
 
-    // If OSM didn't work well, try Nominatim
-    if (osmLeads.length < 20) {
-      const nominatimLeads = await scrapeNominatim(params, countryCoord);
-      leads.push(...nominatimLeads);
-    }
+    // Always try Nominatim as fallback (more reliable)
+    console.log('Trying Nominatim...');
+    const nominatimLeads = await scrapeNominatim(params, countryCoord);
+    leads.push(...nominatimLeads);
+    console.log(`Nominatim results: ${nominatimLeads.length}`);
+
+    console.log(`Total leads before filtering: ${leads.length}`);
 
     return leads;
   } catch (error) {
