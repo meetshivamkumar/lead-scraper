@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: lead-scraper-bot
+    runtime: node
+    runtimeVersion: 20.18.0
+    buildCommand: npm install
+    startCommand: node bot.js
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        scope: build,runtime
+      - key: GOOGLE_SHEET_ID
+        scope: build,runtime
+      - key: GOOGLE_SERVICE_ACCOUNT
+        scope: build,runtime
+    healthCheckPath: /
+    autoDeploy: true
